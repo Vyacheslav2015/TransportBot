@@ -1,0 +1,115 @@
+{
+  "theme": "light",
+  "archetype": "Swiss & High-Contrast (Archetype 4)",
+  "colors": {
+    "background": "#ffffff",
+    "foreground": "#000000",
+    "primary": "#002FA7",
+    "primary_foreground": "#ffffff",
+    "secondary": "#f4f4f5",
+    "secondary_foreground": "#18181b",
+    "muted": "#f4f4f5",
+    "muted_foreground": "#71717a",
+    "accent": "#f4f4f5",
+    "accent_foreground": "#18181b",
+    "destructive": "#E5484D",
+    "destructive_foreground": "#ffffff",
+    "border": "#e4e4e7",
+    "input": "#e4e4e7",
+    "ring": "#002FA7",
+    "success": "#00A381",
+    "warning": "#FFE629",
+    "terminal_bg": "#09090b",
+    "terminal_fg": "#fafafa"
+  },
+  "typography": {
+    "headings": "IBM Plex Sans",
+    "body": "IBM Plex Sans",
+    "mono": "IBM Plex Mono",
+    "base_size": "16px",
+    "heading_scale": {
+      "h1": "text-3xl tracking-tight font-bold",
+      "h2": "text-2xl tracking-tight font-semibold",
+      "h3": "text-xl tracking-tight font-medium",
+      "h4": "text-lg tracking-tight font-medium",
+      "metric": "text-5xl font-mono font-medium tracking-tighter"
+    }
+  },
+  "layout": {
+    "strategy": "The 'Control Room' Grid",
+    "spacing_scale": "p-6 md:p-8",
+    "container": "min-h-screen bg-secondary p-4 md:p-8",
+    "grid_structure": "grid grid-cols-1 lg:grid-cols-12 gap-px bg-border/60 border border-border/60"
+  },
+  "surface_strategy": {
+    "name": "Grid Borders (Technical Look)",
+    "container_classes": "bg-white",
+    "border_radius": "rounded-none",
+    "shadows": "shadow-none",
+    "hover_effects": "hover:bg-muted/30 transition-colors"
+  },
+  "components": {
+    "grid_item": {
+      "styles": "bg-white p-6 flex flex-col gap-4"
+    },
+    "card_header": {
+      "styles": "flex flex-row items-center justify-between space-y-0 pb-2 border-b border-border/40",
+      "title": "text-xs uppercase tracking-[0.2em] font-semibold text-muted-foreground"
+    },
+    "button": {
+      "styles": "rounded-none font-medium transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 flex items-center justify-center gap-2",
+      "primary": "bg-primary text-primary-foreground hover:bg-primary/90 shadow-sm",
+      "destructive": "bg-destructive text-destructive-foreground hover:bg-destructive/90 shadow-sm",
+      "outline": "border border-input bg-background hover:bg-accent hover:text-accent-foreground"
+    },
+    "badge": {
+      "styles": "rounded-none px-2.5 py-0.5 text-xs font-mono uppercase tracking-widest font-bold",
+      "online": "bg-success/15 text-success border border-success/30",
+      "offline": "bg-destructive/15 text-destructive border border-destructive/30",
+      "neutral": "bg-muted text-muted-foreground border border-border"
+    },
+    "log_viewer": {
+      "container": "bg-terminal_bg text-terminal_fg font-mono text-sm p-4 overflow-y-auto overflow-x-hidden h-[500px] w-full border-none",
+      "line": "flex gap-3 py-1 hover:bg-white/5",
+      "timestamp": "text-zinc-500 shrink-0",
+      "level_info": "text-blue-400 shrink-0 w-12",
+      "level_warn": "text-yellow-400 shrink-0 w-12",
+      "level_error": "text-red-400 shrink-0 w-12",
+      "message": "text-zinc-300 break-all"
+    }
+  },
+  "icons": {
+    "library": "lucide-react",
+    "style": "stroke-[1.5px]",
+    "instructions": "Use lucide-react. Standardize sizes to w-4 h-4 for inline or w-5 h-5 for section headers."
+  },
+  "animations": {
+    "hover": "transition-all duration-200 ease-in-out",
+    "pulse": "animate-pulse"
+  },
+  "testing": {
+    "required_attributes": [
+      "data-testid"
+    ],
+    "examples": {
+      "restart_button": "data-testid='restart-bot-button'",
+      "status_indicator": "data-testid='bot-status-indicator'",
+      "uptime_display": "data-testid='uptime-display'",
+      "processed_metric": "data-testid='processed-metric'",
+      "forwarded_metric": "data-testid='forwarded-metric'",
+      "blocked_metric": "data-testid='blocked-metric'",
+      "config_panel": "data-testid='config-panel'",
+      "logs_viewer": "data-testid='recent-logs-viewer'"
+    }
+  },
+  "specific_instructions_for_main_agent": [
+    "Grid Construction: Do not use typical floating Shadcn Cards for the main layout. Create a master grid wrapper (`grid grid-cols-1 lg:grid-cols-12 gap-px bg-border/60 border border-border/60`) and place pure `div`s with `bg-white` inside. This creates a flawless 1px structural grid layout (The Swiss Brutalist 'Control Room' look).",
+    "Typography: Import 'IBM Plex Sans' and 'IBM Plex Mono' from Google Fonts. Do NOT use Inter for headings. Use IBM Plex Mono strictly for numerical metrics, badges, and the log viewer.",
+    "Bento Spans: Top row metrics (Status, Uptime) should be small (col-span-3). Message stats (Processed, Forwarded, Blocked) col-span-4. Log Viewer should take up a massive chunk (col-span-12 lg:col-span-8 row-span-2), with Config Panel beside it (col-span-12 lg:col-span-4 row-span-2).",
+    "Log Viewer: Must have a deeply contrasting terminal aesthetic (bg-zinc-950) nestled within the stark white grid. Use monospaced fonts and syntax-highlighted colors for different log levels (INFO, WARN, ERROR).",
+    "Component Overrides: Override Shadcn UI defaults heavily. Set border-radius to `0` everywhere (`rounded-none`). Remove soft box-shadows. This UI must feel like sharp, precise engineering tooling.",
+    "Restart Button: Place this prominently in the top-right of the header or config panel, styled with the destructive variant but requiring a confirmation dialog (AlertDialog) before execution.",
+    "Use data-testid attributes extensively as outlined in the testing section."
+  ],
+  "image_urls": {}
+}
