@@ -5,6 +5,7 @@ import os
 import logging
 import json
 import subprocess
+import signal
 from pathlib import Path
 from datetime import datetime, timezone
 import httpx
@@ -15,9 +16,15 @@ load_dotenv(ROOT_DIR / '.env')
 app = FastAPI()
 api_router = APIRouter(prefix="/api")
 
-CONFIG_PATH = '/root/clawd/transport-bot-config.json'
-STATE_PATH = '/root/clawd/transport-bot-state.json'
+BOT_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'bot')
+BOT_SCRIPT = os.path.join(BOT_DIR, 'transport-monitor-bot.js')
+CONFIG_PATH = os.path.join(BOT_DIR, 'transport-bot-config.json')
+STATE_PATH = os.path.join(BOT_DIR, 'transport-bot-state.json')
 BOT_STATUS_URL = 'http://127.0.0.1:8099/health'
+BOT_LOG_FILE = os.path.join(BOT_DIR, 'bot.log')
+BOT_ERR_FILE = os.path.join(BOT_DIR, 'bot.err.log')
+
+bot_process = None
 
 def read_json_file(filepath):
     try:
@@ -25,6 +32,62 @@ def read_json_file(filepath):
             return json.load(f)
     except Exception:
         return None
+
+def start_bot_process():
+    global bot_process
+    if bot_process and bot_process.poll() is None:
+        logger.info("Bot already running (PID: %s)", bot_process.pid)
+        return
+    try:
+        stdout_f = open(BOT_LOG_FILE, 'a')
+        stderr_f = open(BOT_ERR_FILE, 'a')
+        bot_process = subprocess.Popen(
+            ['node', BOT_SCRIPT],
+            cwd=BOT_DIR,
+            stdout=stdout_f,
+            stderr=stderr_f,
+            env={**os.environ, 'NODE_ENV': 'production'}
+        )
+        logger.info("Bot started (PID: %s)", bot_process.pid)
+    except Exception as e:
+        logger.error("Failed to start bot: %s", e)
+
+def stop_bot_process():
+    global bot_process
+    if bot_process and bot_process.poll() is None:
+        logger.info("Stopping bot (PID: %s)", bot_process.pid)
+        bot_process.terminate()
+        try:
+            bot_process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            bot_process.kill()
+    bot_process = None
+
+def ensure_bot_running():
+    """Check if bot is running via supervisor or as subprocess, start if neither"""
+    global bot_process
+    # Check supervisor first
+    try:
+        result = subprocess.run(
+            ['sudo', 'supervisorctl', 'status', 'transport-bot'],
+            capture_output=True, text=True, timeout=5
+        )
+        if 'RUNNING' in result.stdout:
+            return  # Supervisor manages it
+    except Exception:
+        pass
+    # Fallback: manage as subprocess
+    if bot_process is None or bot_process.poll() is not None:
+        start_bot_process()
+
+@app.on_event("startup")
+async def startup_event():
+    logger.info("Backend starting, ensuring bot is running...")
+    ensure_bot_running()
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    stop_bot_process()
 
 @api_router.get("/")
 async def root():
@@ -56,21 +119,46 @@ async def get_bot_config():
 @api_router.get("/bot/logs")
 async def get_bot_logs(lines: int = 50):
     logs = {"stdout": [], "stderr": []}
-    for logtype, filepath in [("stdout", "/var/log/supervisor/transport-bot.out.log"), ("stderr", "/var/log/supervisor/transport-bot.err.log")]:
+    log_paths = [
+        ("stdout", "/var/log/supervisor/transport-bot.out.log"),
+        ("stderr", "/var/log/supervisor/transport-bot.err.log"),
+        ("stdout", BOT_LOG_FILE),
+        ("stderr", BOT_ERR_FILE),
+    ]
+    for logtype, filepath in log_paths:
+        if not os.path.exists(filepath):
+            continue
         try:
             result = subprocess.run(['tail', f'-{lines}', filepath], capture_output=True, text=True, timeout=5)
-            logs[logtype] = result.stdout.strip().split('\n') if result.stdout.strip() else []
+            if result.stdout.strip():
+                existing = logs.get(logtype, [])
+                existing.extend(result.stdout.strip().split('\n'))
+                logs[logtype] = existing
         except Exception:
-            logs[logtype] = []
+            pass
     return logs
 
 @api_router.post("/bot/restart")
 async def restart_bot():
+    global bot_process
+    # Try supervisor first
     try:
-        result = subprocess.run(['sudo', 'supervisorctl', 'restart', 'transport-bot'], capture_output=True, text=True, timeout=10)
-        return {"success": True, "output": result.stdout.strip()}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
+        result = subprocess.run(
+            ['sudo', 'supervisorctl', 'status', 'transport-bot'],
+            capture_output=True, text=True, timeout=5
+        )
+        if 'RUNNING' in result.stdout or 'STOPPED' in result.stdout:
+            result = subprocess.run(
+                ['sudo', 'supervisorctl', 'restart', 'transport-bot'],
+                capture_output=True, text=True, timeout=10
+            )
+            return {"success": True, "output": result.stdout.strip(), "method": "supervisor"}
+    except Exception:
+        pass
+    # Fallback: restart subprocess
+    stop_bot_process()
+    start_bot_process()
+    return {"success": True, "output": f"Bot restarted as subprocess (PID: {bot_process.pid if bot_process else 'N/A'})", "method": "subprocess"}
 
 app.include_router(api_router)
 

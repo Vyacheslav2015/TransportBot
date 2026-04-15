@@ -34,6 +34,8 @@ Telegram bot for monitoring groups and forwarding messages with keyword filterin
 - [x] Supervisor configuration with autorestart
 - [x] Health check script
 - [x] All tests passed 100% (backend, frontend, infrastructure)
+- [x] **FIX: Moved bot files from /root/clawd/ to /app/bot/ for deployment**
+- [x] **FIX: Backend auto-starts bot as subprocess when supervisor not available (deployment)**
 
 ## User Personas
 - **Bot Owner**: Manages bot via Telegram commands and web dashboard
