@@ -235,6 +235,8 @@ function App() {
   };
 
   const isOnline = status?.status === 'running';
+  const subprocess = status?.subprocess;
+  const diagnostics = status?.diagnostics;
 
   if (loading) {
     return (
@@ -294,10 +296,20 @@ function App() {
               <Activity className="w-4 h-4" style={{ color: isOnline ? 'var(--success)' : 'var(--destructive)' }} strokeWidth={1.5} />
             </div>
             <StatusBadge online={isOnline} />
-            <div className="mt-auto pt-2">
+            <div className="mt-auto pt-2 flex flex-col gap-1">
               <span className="font-mono text-xs" style={{ color: 'var(--muted-foreground)' }}>
                 Last Update ID: {status?.lastUpdateId || 0}
               </span>
+              {subprocess && !isOnline && (
+                <span className="font-mono text-xs" style={{ color: 'var(--destructive)' }}>
+                  {subprocess.last_error ? subprocess.last_error.substring(0, 80) : `PID: ${subprocess.pid || 'none'}, attempts: ${subprocess.start_attempts || 0}`}
+                </span>
+              )}
+              {diagnostics && !isOnline && (
+                <span className="font-mono text-xs" style={{ color: 'var(--muted-foreground)' }}>
+                  node: {diagnostics.node_binary ? 'OK' : 'MISSING'} | token: {diagnostics.token_in_env ? 'OK' : 'MISSING'}
+                </span>
+              )}
             </div>
           </div>
         </div>
