@@ -36,7 +36,11 @@ Telegram bot for monitoring groups and forwarding messages with keyword filterin
 - [x] All tests passed 100% (backend, frontend, infrastructure)
 - [x] **FIX: Moved bot files from /root/clawd/ to /app/bot/ for deployment**
 - [x] **FIX: Backend auto-starts bot as subprocess when supervisor not available (deployment)**
-- [x] **FIX: Keep-alive ping every 4 min from bot + backend to prevent deployed pod from sleeping**
+- [x] **FIX: Keep-alive ping every 60s from bot + backend to prevent deployed pod from sleeping**
+- [x] **FIX: Tokens moved to env vars (TELEGRAM_BOT_TOKEN, EMERGENT_LLM_KEY) — removed from JSON**
+- [x] **FIX: Removed sudo from supervisorctl, added bot watchdog (auto-restart subprocess)**
+- [x] **FIX: Backend passes all env vars to bot subprocess on start**
+- [x] **Deployment agent: PASS - no blockers found**
 
 ## User Personas
 - **Bot Owner**: Manages bot via Telegram commands and web dashboard
