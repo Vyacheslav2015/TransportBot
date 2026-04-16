@@ -1,5 +1,5 @@
 {
-  "lastUpdateId": 109378775,
+  "lastUpdateId": 109378777,
   "seenMessages": [
     "901271393:195",
     "-5159430321:197",
@@ -33,13 +33,15 @@
     "-5159430321:274",
     "901271393:275",
     "-5159430321:279",
-    "-5159430321:282"
+    "-5159430321:282",
+    "901271393:297",
+    "-5159430321:299"
   ],
-  "lastForwardTime": 1776351075602,
+  "lastForwardTime": 1776354759977.626,
   "stats": {
-    "totalProcessed": 17,
-    "totalForwarded": 11,
+    "totalProcessed": 18,
+    "totalForwarded": 12,
     "totalBlocked": 0,
-    "startedAt": "2026-04-16T14:33:37.972Z"
+    "startedAt": "2026-04-16T15:51:21.290987+00:00"
   }
 }

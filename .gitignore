@@ -84,3 +84,12 @@ android-sdk/
 bot/transport-bot-state.json
 bot/bot.log
 bot/bot.err.log
+-e 
+# Environment and credential files
+.env
+.env.*
+*.env
+credentials.json
+*.pem
+*.key
+.credentials
