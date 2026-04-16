@@ -80,3 +80,7 @@ memory/test_credentials.md
 
 # Mobile development
 android-sdk/
+# Bot state files
+bot/transport-bot-state.json
+bot/bot.log
+bot/bot.err.log

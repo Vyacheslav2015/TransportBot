@@ -16,14 +16,24 @@ function loadConfig() {
   try {
     const raw = fs.readFileSync(CONFIG_PATH, 'utf8');
     config = JSON.parse(raw);
-    // Env overrides
-    if (process.env.TELEGRAM_BOT_TOKEN) config.botToken = process.env.TELEGRAM_BOT_TOKEN;
-    if (process.env.EMERGENT_LLM_KEY) config.llmApiKey = process.env.EMERGENT_LLM_KEY;
-    log('Config loaded');
   } catch (err) {
-    logError('Failed to load config', err);
+    logError('Failed to load config JSON, using defaults', err);
+    config = {};
+  }
+  // Env overrides (ALWAYS take priority)
+  if (process.env.TELEGRAM_BOT_TOKEN) config.botToken = process.env.TELEGRAM_BOT_TOKEN;
+  if (process.env.EMERGENT_LLM_KEY) config.llmApiKey = process.env.EMERGENT_LLM_KEY;
+  // Defaults
+  if (!config.keywords) config.keywords = [];
+  if (!config.negKeywords) config.negKeywords = [];
+  if (!config.destUserIds) config.destUserIds = [];
+  if (!config.threshold) config.threshold = 1;
+  if (!config.rateLimit) config.rateLimit = 1000;
+  if (!config.botToken) {
+    logError('No bot token! Set TELEGRAM_BOT_TOKEN env var or botToken in config');
     process.exit(1);
   }
+  log('Config loaded');
 }
 
 function saveConfig() {
