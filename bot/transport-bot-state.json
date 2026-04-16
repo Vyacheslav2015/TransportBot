@@ -45,13 +45,15 @@
     "-999:3",
     "-999:5",
     "-999:1",
-    "-999:2"
+    "-999:2",
+    "-999:90001",
+    "-999:90002"
   ],
-  "lastForwardTime": 1776362046741.1245,
+  "lastForwardTime": 1776362931031.8135,
   "stats": {
-    "totalProcessed": 24,
-    "totalForwarded": 18,
+    "totalProcessed": 26,
+    "totalForwarded": 19,
     "totalBlocked": 0,
-    "startedAt": "2026-04-16T17:53:34.591248+00:00"
+    "startedAt": "2026-04-16T18:08:24.218977+00:00"
   }
 }

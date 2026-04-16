@@ -360,45 +360,43 @@ class TransportMonitorBot:
 
     async def handle_update(self, update: dict):
         """Process a single update from Telegram webhook.
-        Raises on internal failure so the caller can return non-200 to Telegram."""
+        Raises on internal failure so the caller can return non-200 to Telegram.
+        Dedup state is only committed after the update is fully handled."""
         now = datetime.now(timezone.utc).isoformat()
         self._last_webhook_received = now
         self._webhook_count += 1
 
         msg = update.get('message') or update.get('channel_post')
         if not msg:
-            return  # not a message type we handle — 200 OK is correct
+            return
         text = msg.get('text') or msg.get('caption') or ''
         if not text:
-            return  # no text content — 200 OK is correct
+            return
 
         async with self._state_lock:
             msg_key = f"{msg['chat']['id']}:{msg['message_id']}"
             if msg_key in self.state.get('seenMessages', []):
-                return  # duplicate — 200 OK
-            self.state.setdefault('seenMessages', []).append(msg_key)
+                return  # genuinely already processed
 
             uid = update.get('update_id', 0)
-            if uid > self.state.get('lastUpdateId', 0):
-                self.state['lastUpdateId'] = uid
 
-            self._last_update_processed = now
+            # --- process the update (may raise) ---
 
             # Commands in private chat
             if msg.get('chat', {}).get('type') == 'private':
                 if await self.handle_command(msg):
-                    self.save_state()
+                    self._commit_update(msg_key, uid, now)
                     return
 
             # Chat whitelist
             allowed = self.config.get('allowedChats', [])
             if allowed and str(msg['chat']['id']) not in allowed:
-                self.save_state()
+                self._commit_update(msg_key, uid, now)
                 return
 
             # Skip private non-command messages
             if msg.get('chat', {}).get('type') == 'private':
-                self.save_state()
+                self._commit_update(msg_key, uid, now)
                 return
 
             self.state['stats']['totalProcessed'] += 1
@@ -408,19 +406,30 @@ class TransportMonitorBot:
                 self.state['stats']['totalBlocked'] += 1
                 if self.config.get('debug'):
                     logger.info(f"BLOCKED: '{result['matchedNeg']}' in: {text[:80]}")
-                self.save_state()
+                self._commit_update(msg_key, uid, now)
                 return
 
             if self.config.get('debug'):
                 logger.info(f"Score: {result['score']}/{self.config.get('threshold', 1)} for: {text[:80]}... [{', '.join(result.get('matched', []))}]")
 
             if result['score'] < self.config.get('threshold', 1):
-                self.save_state()
+                self._commit_update(msg_key, uid, now)
                 return
 
-            # forward_message can raise — let it propagate for Telegram retry
+            # forward_message can raise — if it does, nothing is committed,
+            # webhook returns 500, Telegram retries, and the update is NOT in
+            # seenMessages so it will be processed again.
             await self.forward_message(msg, result['score'], None, result.get('matched'))
-            self.save_state()
+            self._commit_update(msg_key, uid, now)
+
+    def _commit_update(self, msg_key: str, update_id: int, timestamp: str):
+        """Mark an update as successfully processed. Call only after all
+        processing for this update has completed without error."""
+        self.state.setdefault('seenMessages', []).append(msg_key)
+        if update_id > self.state.get('lastUpdateId', 0):
+            self.state['lastUpdateId'] = update_id
+        self._last_update_processed = timestamp
+        self.save_state()
 
     # ─── STATUS ──────────────────────────────────────────────
 
