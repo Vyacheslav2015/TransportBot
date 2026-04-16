@@ -1,16 +1,21 @@
 """
-Telegram Transport Monitor Bot — Python asyncio implementation.
-Runs as a supervised background task inside the FastAPI process.
+Telegram Transport Monitor Bot — Webhook mode.
 
-Lifecycle: start() → creates asyncio task → poll loop → stop() cancels it.
-Health: tracks last_poll_ok, last_error, task alive/dead via get_status().
+Architecture: Telegram POSTs updates to /api/bot/webhook/<secret>.
+No background polling task. The bot is alive whenever FastAPI is alive.
+Pod suspension is fine — Telegram retries delivery when pod wakes up.
+
+Lifecycle:
+  init()           → load config/state, register webhook with Telegram
+  handle_update()  → called per incoming webhook POST
+  shutdown()       → delete webhook from Telegram
 """
 import httpx
-import asyncio
 import json
 import os
 import logging
 import time
+import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -22,6 +27,11 @@ STATE_PATH = os.path.join(BOT_DIR, 'transport-bot-state.json')
 TELEGRAM_API = "https://api.telegram.org"
 
 
+def _generate_webhook_secret(token: str) -> str:
+    """Derive a stable secret from the bot token so we don't need extra env vars."""
+    return hashlib.sha256(f"webhook-{token}".encode()).hexdigest()[:32]
+
+
 class TransportMonitorBot:
     def __init__(self):
         self.config = {}
@@ -31,17 +41,14 @@ class TransportMonitorBot:
             "lastForwardTime": 0,
             "stats": {"totalProcessed": 0, "totalForwarded": 0, "totalBlocked": 0, "startedAt": None}
         }
-        # Lifecycle
-        self._task: asyncio.Task | None = None
-        self._lock = asyncio.Lock()  # prevents concurrent start/stop
-        self._polling = False  # True only while poll loop is actively running
+        self.webhook_secret = ""
+        self._initialized = False
 
         # Health telemetry
-        self._last_poll_ok: str | None = None  # ISO timestamp of last successful poll cycle
-        self._last_update_received: str | None = None  # ISO timestamp of last Telegram update
+        self._last_webhook_received: str | None = None
+        self._last_update_processed: str | None = None
         self._last_error: str | None = None
-        self._restart_count = 0
-        self._poll_count = 0
+        self._webhook_count = 0
         self._started_at: str | None = None
 
     # ─── CONFIG & STATE ──────────────────────────────────────
@@ -119,15 +126,84 @@ class TransportMonitorBot:
     async def telegram_api(self, method, params=None):
         token = self.config.get('botToken', '')
         url = f"{TELEGRAM_API}/bot{token}/{method}"
-        timeout = 35.0 if method == 'getUpdates' else 15.0
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        async with httpx.AsyncClient(timeout=15.0) as client:
             resp = await client.post(url, json=params or {})
             data = resp.json()
             if data.get('ok'):
                 return data.get('result')
             raise Exception(f"Telegram API: {data.get('description', 'Unknown error')}")
 
-    # ─── MESSAGE LOGIC (unchanged business logic) ────────────
+    # ─── WEBHOOK REGISTRATION ────────────────────────────────
+
+    async def register_webhook(self, base_url: str):
+        """Register webhook with Telegram. Called on startup."""
+        webhook_url = f"{base_url.rstrip('/')}/api/bot/webhook/{self.webhook_secret}"
+        logger.info(f"Registering webhook: {webhook_url}")
+        try:
+            result = await self.telegram_api('setWebhook', {
+                'url': webhook_url,
+                'allowed_updates': ['message', 'channel_post'],
+                'drop_pending_updates': False,
+                'secret_token': self.webhook_secret,
+            })
+            logger.info(f"Webhook registered: {result}")
+            return True
+        except Exception as e:
+            self._last_error = f"{datetime.now(timezone.utc).isoformat()} Webhook registration failed: {e}"
+            logger.error(f"Webhook registration failed: {e}")
+            return False
+
+    async def delete_webhook(self):
+        """Delete webhook from Telegram. Called on shutdown."""
+        try:
+            await self.telegram_api('deleteWebhook', {'drop_pending_updates': False})
+            logger.info("Webhook deleted")
+        except Exception as e:
+            logger.warning(f"Webhook delete failed: {e}")
+
+    # ─── INITIALIZATION ──────────────────────────────────────
+
+    async def init(self, base_url: str):
+        """Initialize bot: load config, register webhook."""
+        self.load_config()
+        self.load_state()
+
+        if not self.config.get('botToken'):
+            logger.error("NO BOT TOKEN — cannot start bot")
+            return False
+
+        self.webhook_secret = _generate_webhook_secret(self.config['botToken'])
+        self._started_at = datetime.now(timezone.utc).isoformat()
+        self.state['stats']['startedAt'] = self._started_at
+
+        logger.info("=== Transport Monitor Bot (Webhook mode) ===")
+        logger.info(f"Token: {self.config['botToken'][:10]}...")
+        logger.info(f"Recipients: {', '.join(self.config.get('destUserIds', []))}")
+        logger.info(f"Keywords: {len(self.config.get('keywords', []))} pos, {len(self.config.get('negKeywords', []))} neg")
+
+        ok = await self.register_webhook(base_url)
+
+        # Startup notification
+        try:
+            mode = "webhook" if ok else "webhook (FAILED to register)"
+            for uid in self.config.get('destUserIds', []):
+                await self.telegram_api('sendMessage', {
+                    'chat_id': uid,
+                    'text': f'\u2705 Transport Monitor Bot started!\nMode: {mode}\n\n/status - check config\n/start - all commands'
+                })
+        except Exception as e:
+            logger.warning(f"Startup notification failed: {e}")
+
+        self._initialized = ok
+        return ok
+
+    async def shutdown(self):
+        """Clean shutdown: delete webhook."""
+        await self.delete_webhook()
+        self._initialized = False
+        logger.info("Bot shutdown complete")
+
+    # ─── MESSAGE LOGIC ───────────────────────────────────────
 
     def score_message(self, text):
         lower = text.lower()
@@ -164,6 +240,7 @@ class TransportMonitorBot:
                 now = time.time() * 1000
                 elapsed = now - self.state.get('lastForwardTime', 0)
                 if elapsed < self.config.get('rateLimit', 1000):
+                    import asyncio
                     await asyncio.sleep((self.config['rateLimit'] - elapsed) / 1000)
                 await self.telegram_api('sendMessage', {'chat_id': rid, 'text': forward_text, 'disable_web_page_preview': True})
                 self.state['lastForwardTime'] = time.time() * 1000
@@ -191,13 +268,14 @@ class TransportMonitorBot:
             reply = "\U0001F697 Transport Monitor Bot\n\nКоманды:\n/status - Текущая конфигурация\n/threshold <n> - Порог (1-10)\n/llm on|off - LLM анализ\n/debug on|off - Debug логи\n/addchat <id> - Добавить группу\n/rmchat <id> - Удалить группу"
         elif cmd == '/status':
             s = self.state.get('stats', {})
-            poll_ago = ''
-            if self._last_poll_ok:
-                secs = int((datetime.now(timezone.utc) - datetime.fromisoformat(self._last_poll_ok)).total_seconds())
-                poll_ago = f" ({secs}s ago)"
+            wh_ago = ''
+            if self._last_webhook_received:
+                secs = int((datetime.now(timezone.utc) - datetime.fromisoformat(self._last_webhook_received)).total_seconds())
+                wh_ago = f" ({secs}s ago)"
             reply = (
                 f"\U0001F4CA Status:\n\n"
-                f"\U0001F527 Mode: {'Keywords + LLM' if self.config.get('useLLM') else 'Keywords only'}\n"
+                f"\U0001F527 Mode: Webhook"
+                f"{' + LLM' if self.config.get('useLLM') else ''}\n"
                 f"\U0001F4CB Allowed chats: {', '.join(self.config.get('allowedChats', [])) or 'ALL'}\n"
                 f"\U0001F3AF Threshold: {self.config.get('threshold', 1)}\n"
                 f"\U0001F511 Keywords: {len(self.config.get('keywords', []))}\n"
@@ -206,8 +284,8 @@ class TransportMonitorBot:
                 f"\U0001F4BE Seen: {len(self.state.get('seenMessages', []))}\n"
                 f"\U0001F50D Debug: {'ON' if self.config.get('debug') else 'OFF'}\n"
                 f"\U0001F9E0 LLM: {'ON' if self.config.get('useLLM') else 'OFF'}\n"
-                f"\U0001F4E1 Polling: {'active' if self._polling else 'DEAD'}{poll_ago}\n"
-                f"\U0001F504 Polls: {self._poll_count}\n\n"
+                f"\U0001F4E1 Last webhook: {wh_ago or 'none'}\n"
+                f"\U0001F504 Webhooks received: {self._webhook_count}\n\n"
                 f"\U0001F4C8 Stats:\n  Processed: {s.get('totalProcessed', 0)}\n  Forwarded: {s.get('totalForwarded', 0)}\n  Blocked: {s.get('totalBlocked', 0)}"
             )
         elif cmd == '/threshold':
@@ -273,158 +351,73 @@ class TransportMonitorBot:
                 logger.warning(f"Command reply failed: {e}")
         return True
 
-    async def process_update(self, update):
+    # ─── WEBHOOK HANDLER ─────────────────────────────────────
+
+    async def handle_update(self, update: dict):
+        """Process a single update from Telegram webhook. Called by FastAPI route."""
+        now = datetime.now(timezone.utc).isoformat()
+        self._last_webhook_received = now
+        self._webhook_count += 1
+
         msg = update.get('message') or update.get('channel_post')
         if not msg:
             return
         text = msg.get('text') or msg.get('caption') or ''
         if not text:
             return
+
         msg_key = f"{msg['chat']['id']}:{msg['message_id']}"
         if msg_key in self.state.get('seenMessages', []):
             return
         self.state.setdefault('seenMessages', []).append(msg_key)
+
+        # Track update ID for state
+        uid = update.get('update_id', 0)
+        if uid > self.state.get('lastUpdateId', 0):
+            self.state['lastUpdateId'] = uid
+
+        self._last_update_processed = now
+
+        # Commands in private chat
         if msg.get('chat', {}).get('type') == 'private':
             if await self.handle_command(msg):
+                self.save_state()
                 return
+
+        # Chat whitelist
         allowed = self.config.get('allowedChats', [])
         if allowed and str(msg['chat']['id']) not in allowed:
+            self.save_state()
             return
+
+        # Skip private non-command messages
         if msg.get('chat', {}).get('type') == 'private':
+            self.save_state()
             return
+
         self.state['stats']['totalProcessed'] += 1
         result = self.score_message(text)
+
         if result['blocked']:
             self.state['stats']['totalBlocked'] += 1
             if self.config.get('debug'):
                 logger.info(f"BLOCKED: '{result['matchedNeg']}' in: {text[:80]}")
+            self.save_state()
             return
+
         if self.config.get('debug'):
             logger.info(f"Score: {result['score']}/{self.config.get('threshold', 1)} for: {text[:80]}... [{', '.join(result.get('matched', []))}]")
+
         if result['score'] < self.config.get('threshold', 1):
-            return
-        await self.forward_message(msg, result['score'], None, result.get('matched'))
-
-    # ─── POLLING ─────────────────────────────────────────────
-
-    async def poll(self):
-        updates = await self.telegram_api('getUpdates', {
-            'offset': self.state.get('lastUpdateId', 0) + 1,
-            'timeout': 30,
-            'allowed_updates': ['message', 'channel_post']
-        })
-        self._last_poll_ok = datetime.now(timezone.utc).isoformat()
-        self._poll_count += 1
-        if updates:
-            self._last_update_received = datetime.now(timezone.utc).isoformat()
-            if self.config.get('debug'):
-                logger.info(f"Received {len(updates)} update(s)")
-            for u in updates:
-                self.state['lastUpdateId'] = u['update_id']
-                try:
-                    await self.process_update(u)
-                except Exception as e:
-                    logger.warning(f"Error processing update: {e}")
             self.save_state()
-
-    async def _poll_loop(self):
-        """The inner polling loop. Runs until cancelled or self._polling is cleared."""
-        self.load_config()
-        self.load_state()
-
-        if not self.config.get('botToken'):
-            logger.error("NO BOT TOKEN — cannot start bot")
             return
 
-        self._polling = True
-        self._started_at = datetime.now(timezone.utc).isoformat()
-        self.state['stats']['startedAt'] = self._started_at
-
-        logger.info("=== Transport Monitor Bot starting (Python) ===")
-        logger.info(f"Token: {self.config['botToken'][:10]}...")
-        logger.info(f"Recipients: {', '.join(self.config.get('destUserIds', []))}")
-        logger.info(f"Keywords: {len(self.config.get('keywords', []))} pos, {len(self.config.get('negKeywords', []))} neg")
-
-        try:
-            for uid in self.config.get('destUserIds', []):
-                await self.telegram_api('sendMessage', {
-                    'chat_id': uid,
-                    'text': '\u2705 Transport Monitor Bot started!\n\n/status - check config\n/start - all commands'
-                })
-        except Exception as e:
-            logger.warning(f"Startup notification failed: {e}")
-
-        try:
-            while self._polling:
-                try:
-                    await self.poll()
-                except asyncio.CancelledError:
-                    raise  # let cancellation propagate
-                except Exception as e:
-                    self._last_error = f"{datetime.now(timezone.utc).isoformat()} {e}"
-                    logger.error(f"Poll error, retry in 10s: {e}")
-                    await asyncio.sleep(10)
-        finally:
-            self._polling = False
-            logger.info("Bot polling loop stopped")
-
-    # ─── PUBLIC LIFECYCLE API ────────────────────────────────
-
-    async def start(self):
-        """Start the bot polling task. Safe to call multiple times."""
-        async with self._lock:
-            if self._task and not self._task.done():
-                logger.info("Bot already running, ignoring duplicate start")
-                return
-            logger.info("Starting bot task...")
-            self._task = asyncio.create_task(self._poll_loop(), name="telegram-bot")
-            self._task.add_done_callback(self._on_task_done)
-
-    def _on_task_done(self, task: asyncio.Task):
-        """Callback when the bot task finishes (crash or clean stop)."""
-        try:
-            exc = task.exception()
-        except asyncio.CancelledError:
-            logger.info("Bot task was cancelled (clean shutdown)")
-            return
-        if exc:
-            self._last_error = f"{datetime.now(timezone.utc).isoformat()} TASK CRASHED: {exc}"
-            logger.error(f"Bot task CRASHED: {exc}")
-        else:
-            logger.info("Bot task exited normally")
-
-    async def stop(self):
-        """Stop the bot polling task. Waits for clean exit."""
-        async with self._lock:
-            self._polling = False
-            if self._task and not self._task.done():
-                self._task.cancel()
-                try:
-                    await asyncio.wait_for(self._task, timeout=5)
-                except (asyncio.CancelledError, asyncio.TimeoutError):
-                    pass
-            self._task = None
-            logger.info("Bot stopped")
-
-    async def restart(self):
-        """Safe restart: fully stop, then start. No duplicate loops."""
-        self._restart_count += 1
-        logger.info(f"Bot restart #{self._restart_count}")
-        await self.stop()
-        await self.start()
+        await self.forward_message(msg, result['score'], None, result.get('matched'))
+        self.save_state()
 
     # ─── STATUS ──────────────────────────────────────────────
 
     def get_status(self):
-        task_alive = self._task is not None and not self._task.done()
-        # Determine real status
-        if task_alive and self._polling:
-            status = "running"
-        elif task_alive and not self._polling:
-            status = "starting"
-        else:
-            status = "stopped"
-
         uptime = 0
         if self._started_at:
             try:
@@ -433,16 +426,15 @@ class TransportMonitorBot:
                 pass
 
         return {
-            "status": status,
+            "status": "running" if self._initialized else "stopped",
+            "mode": "webhook",
             "uptime": uptime,
             "health": {
-                "task_alive": task_alive,
-                "polling_active": self._polling,
-                "last_poll_ok": self._last_poll_ok,
-                "last_update_received": self._last_update_received,
+                "webhook_registered": self._initialized,
+                "last_webhook_received": self._last_webhook_received,
+                "last_update_processed": self._last_update_processed,
                 "last_error": self._last_error,
-                "poll_count": self._poll_count,
-                "restart_count": self._restart_count,
+                "webhook_count": self._webhook_count,
             },
             "config": {
                 "useLLM": self.config.get('useLLM', False),

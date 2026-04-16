@@ -1,22 +1,16 @@
 """
 FastAPI backend for Transport Monitor Bot dashboard.
-The Telegram bot runs as a supervised asyncio task in this same process.
+The Telegram bot runs in WEBHOOK mode — no background polling task.
+Telegram pushes updates to POST /api/bot/webhook/<secret>.
 
-NOTE on anti-sleep: Internal self-pinging cannot prevent container/pod suspension.
-If the hosting platform suspends inactive pods, the only real solutions are:
-  1. Webhook mode (Telegram pushes to us — any incoming request wakes the pod)
-  2. External uptime monitor (e.g. UptimeRobot pinging our /api/ endpoint)
-  3. Always-on hosting tier / dedicated worker process
-The previous internal keep-alive loop has been removed because it is ineffective.
+This is compatible with pod suspension: incoming webhooks wake the pod.
 """
-from fastapi import FastAPI, APIRouter
+from fastapi import FastAPI, APIRouter, Request, Response
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 import os
 import logging
-import asyncio
 from pathlib import Path
-from datetime import datetime, timezone
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -29,28 +23,62 @@ from telegram_bot import bot
 app = FastAPI()
 api_router = APIRouter(prefix="/api")
 
-BOT_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'bot')
+
+def _get_app_url() -> str:
+    """Get the external app URL for webhook registration."""
+    return os.environ.get('APP_URL', '').rstrip('/')
 
 
 @app.on_event("startup")
 async def startup_event():
-    logger.info("=== Backend startup ===")
+    logger.info("=== Backend startup (webhook mode) ===")
     logger.info(f"TELEGRAM_BOT_TOKEN set: {bool(os.environ.get('TELEGRAM_BOT_TOKEN'))}")
-    logger.info(f"APP_URL: {os.environ.get('APP_URL', 'not set')}")
-    await bot.start()
+    app_url = _get_app_url()
+    logger.info(f"APP_URL: {app_url or 'NOT SET'}")
+    if app_url:
+        ok = await bot.init(app_url)
+        logger.info(f"Bot init: {'OK' if ok else 'FAILED'}")
+    else:
+        logger.error("APP_URL not set — cannot register webhook. Bot will not receive updates.")
+        bot.load_config()
+        bot.load_state()
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    logger.info("Backend shutting down, stopping bot...")
-    await bot.stop()
+    logger.info("Backend shutting down...")
+    await bot.shutdown()
+
+
+# ─── WEBHOOK ENDPOINT ────────────────────────────────────────
+
+@api_router.post("/bot/webhook/{secret}")
+async def telegram_webhook(secret: str, request: Request):
+    """Receives updates from Telegram. Validates secret token."""
+    if secret != bot.webhook_secret:
+        return Response(status_code=403)
+
+    # Telegram also sends secret in header — double-check
+    header_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+    if header_secret and header_secret != bot.webhook_secret:
+        return Response(status_code=403)
+
+    try:
+        update = await request.json()
+        await bot.handle_update(update)
+    except Exception as e:
+        logger.error(f"Webhook handler error: {e}")
+        bot._last_error = f"{e}"
+
+    # Always return 200 to Telegram (otherwise it retries aggressively)
+    return Response(status_code=200)
 
 
 # ─── API ROUTES ──────────────────────────────────────────────
 
 @api_router.get("/")
 async def root():
-    return {"message": "Transport Monitor Bot API"}
+    return {"message": "Transport Monitor Bot API (webhook mode)"}
 
 
 @api_router.get("/bot/status")
@@ -68,17 +96,13 @@ async def get_bot_config():
 
 @api_router.get("/bot/logs")
 async def get_bot_logs(lines: int = 50):
+    import subprocess as sp
     logs = {"stdout": [], "stderr": []}
-    import subprocess
-    log_paths = [
-        ("stdout", "/var/log/supervisor/backend.out.log"),
-        ("stderr", "/var/log/supervisor/backend.err.log"),
-    ]
-    for logtype, filepath in log_paths:
+    for logtype, filepath in [("stdout", "/var/log/supervisor/backend.out.log"), ("stderr", "/var/log/supervisor/backend.err.log")]:
         if not os.path.exists(filepath):
             continue
         try:
-            result = subprocess.run(['tail', f'-{lines}', filepath], capture_output=True, text=True, timeout=5)
+            result = sp.run(['tail', f'-{lines}', filepath], capture_output=True, text=True, timeout=5)
             if result.stdout.strip():
                 logs[logtype].extend(result.stdout.strip().split('\n'))
         except Exception:
@@ -88,12 +112,14 @@ async def get_bot_logs(lines: int = 50):
 
 @api_router.post("/bot/restart")
 async def restart_bot():
-    await bot.restart()
-    return {
-        "success": True,
-        "restart_count": bot._restart_count,
-        "method": "asyncio (safe restart)",
-    }
+    """Re-register webhook. No polling task to restart."""
+    app_url = _get_app_url()
+    if not app_url:
+        return {"success": False, "error": "APP_URL not set"}
+    await bot.delete_webhook()
+    bot.load_config()
+    ok = await bot.register_webhook(app_url)
+    return {"success": ok, "method": "webhook re-registration"}
 
 
 app.include_router(api_router)

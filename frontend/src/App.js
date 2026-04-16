@@ -237,11 +237,13 @@ function App() {
   const isOnline = status?.status === 'running';
   const health = status?.health;
 
-  function pollAgo() {
-    if (!health?.last_poll_ok) return null;
-    const secs = Math.floor((Date.now() - new Date(health.last_poll_ok).getTime()) / 1000);
+  function lastActivity() {
+    const ts = health?.last_webhook_received || health?.last_poll_ok;
+    if (!ts) return 'never';
+    const secs = Math.floor((Date.now() - new Date(ts).getTime()) / 1000);
     if (secs < 60) return `${secs}s ago`;
-    return `${Math.floor(secs / 60)}m ago`;
+    if (secs < 3600) return `${Math.floor(secs / 60)}m ago`;
+    return `${Math.floor(secs / 3600)}h ago`;
   }
 
   if (loading) {
@@ -304,10 +306,10 @@ function App() {
             <StatusBadge online={isOnline} />
             <div className="mt-auto pt-2 flex flex-col gap-1">
               <span className="font-mono text-xs" style={{ color: 'var(--muted-foreground)' }}>
-                Last poll: {health?.last_poll_ok ? pollAgo() : 'never'}
+                Mode: {status?.mode || 'polling'} | Last activity: {lastActivity()}
               </span>
               <span className="font-mono text-xs" style={{ color: 'var(--muted-foreground)' }}>
-                Polls: {health?.poll_count || 0} | Restarts: {health?.restart_count || 0}
+                Webhooks: {health?.webhook_count || 0}
               </span>
               {health?.last_error && (
                 <span className="font-mono text-xs" style={{ color: 'var(--destructive)' }}>
