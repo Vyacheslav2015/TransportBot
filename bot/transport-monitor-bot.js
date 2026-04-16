@@ -538,17 +538,18 @@ function startKeepAlive() {
     return;
   }
 
-  const pingUrl = appUrl.replace(/\/$/, '') + '/api/';
-  logAlways(`Keep-alive ping target: ${pingUrl}`);
+  const statusUrl = appUrl.replace(/\/$/, '') + '/api/bot/status';
+  logAlways(`Keep-alive ping target: ${statusUrl} (every 60s)`);
 
-  // Ping every 4 minutes to prevent pod from sleeping
+  // Aggressive keep-alive: every 60 seconds with real API call
   setInterval(() => {
-    const url = new URL(pingUrl);
+    const url = new URL(statusUrl);
     const options = {
       hostname: url.hostname,
       port: url.port || 443,
       path: url.pathname,
       method: 'GET',
+      headers: { 'User-Agent': 'TransportBot-KeepAlive/2.0', 'Accept': 'application/json' },
       timeout: 10000
     };
 
@@ -557,15 +558,15 @@ function startKeepAlive() {
       let body = '';
       res.on('data', chunk => body += chunk);
       res.on('end', () => {
-        log(`Keep-alive ping OK (${res.statusCode})`);
+        log(`Keep-alive OK (${res.statusCode})`);
       });
     });
     req.on('error', (err) => {
-      log(`Keep-alive ping failed: ${err.message}`);
+      log(`Keep-alive failed: ${err.message}`);
     });
     req.on('timeout', () => { req.destroy(); });
     req.end();
-  }, 4 * 60 * 1000); // every 4 minutes
+  }, 60 * 1000); // every 60 seconds
 }
 
 // ─── UTILITIES ──────────────────────────────────────────────

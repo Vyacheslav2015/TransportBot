@@ -97,10 +97,10 @@ async def keep_alive_loop():
     ping_url = app_url.rstrip('/') + '/api/'
     logger.info(f"Backend keep-alive target: {ping_url}")
     while True:
-        await asyncio.sleep(240)  # 4 minutes
+        await asyncio.sleep(60)  # every 60 seconds
         try:
             async with httpx.AsyncClient(timeout=10) as client:
-                resp = await client.get(ping_url)
+                resp = await client.get(ping_url, headers={"User-Agent": "TransportBot-Backend-KeepAlive/2.0"})
                 logger.info(f"Keep-alive ping: {resp.status_code}")
         except Exception as e:
             logger.warning(f"Keep-alive ping failed: {e}")
