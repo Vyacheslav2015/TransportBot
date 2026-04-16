@@ -4,11 +4,10 @@
 Telegram bot for monitoring groups and forwarding messages with keyword filtering. Node.js based, running on Emergent Cloud with Supervisor.
 
 ## Architecture
-- **Bot**: Node.js (long polling) at `/root/clawd/transport-monitor-bot.js`
-- **Backend**: FastAPI (Python) providing status API at `/app/backend/server.py`
+- **Bot**: Python asyncio task running INSIDE FastAPI backend (no Node.js subprocess)
+- **Backend**: FastAPI (Python) at `/app/backend/server.py` + `/app/backend/telegram_bot.py`
 - **Frontend**: React dashboard at `/app/frontend/src/App.js`
-- **Supervisor**: Bot managed as `transport-bot` service
-- **Storage**: JSON files (config + state), no database needed for bot
+- **Storage**: JSON files (config + state), no database needed
 
 ## Core Requirements
 1. Long polling Telegram groups 24/7
