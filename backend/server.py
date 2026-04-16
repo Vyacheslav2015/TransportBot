@@ -46,7 +46,7 @@ async def startup_event():
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    logger.info("Backend shutting down...")
+    logger.info("Backend shutting down (webhook stays registered for pod wake-up)...")
     await bot.shutdown()
 
 
@@ -54,24 +54,28 @@ async def shutdown_event():
 
 @api_router.post("/bot/webhook/{secret}")
 async def telegram_webhook(secret: str, request: Request):
-    """Receives updates from Telegram. Validates secret token."""
+    """Receives updates from Telegram. Validates secret token.
+    Returns 200 on success/filtered, 500 on processing failure (Telegram retries)."""
     if secret != bot.webhook_secret:
         return Response(status_code=403)
 
-    # Telegram also sends secret in header — double-check
     header_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
     if header_secret and header_secret != bot.webhook_secret:
         return Response(status_code=403)
 
     try:
         update = await request.json()
-        await bot.handle_update(update)
-    except Exception as e:
-        logger.error(f"Webhook handler error: {e}")
-        bot._last_error = f"{e}"
+    except Exception:
+        return Response(status_code=400)  # malformed JSON, no retry useful
 
-    # Always return 200 to Telegram (otherwise it retries aggressively)
-    return Response(status_code=200)
+    try:
+        await bot.handle_update(update)
+        return Response(status_code=200)
+    except Exception as e:
+        ts = __import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat()
+        bot._last_error = f"{ts} Webhook processing failed: {e}"
+        logger.error(f"Webhook processing failed (returning 500 for retry): {e}")
+        return Response(status_code=500)
 
 
 # ─── API ROUTES ──────────────────────────────────────────────
@@ -83,7 +87,12 @@ async def root():
 
 @api_router.get("/bot/status")
 async def get_bot_status():
-    return bot.get_status()
+    status = bot.get_status()
+    # Enrich with live Telegram webhook info (best-effort, don't block on failure)
+    telegram_info = await bot.fetch_telegram_webhook_info()
+    if telegram_info is not None:
+        status["health"]["telegram_webhook"] = telegram_info
+    return status
 
 
 @api_router.get("/bot/config")
@@ -112,14 +121,23 @@ async def get_bot_logs(lines: int = 50):
 
 @api_router.post("/bot/restart")
 async def restart_bot():
-    """Re-register webhook. No polling task to restart."""
+    """Admin action: re-register webhook from scratch."""
     app_url = _get_app_url()
     if not app_url:
         return {"success": False, "error": "APP_URL not set"}
-    await bot.delete_webhook()
-    bot.load_config()
-    ok = await bot.register_webhook(app_url)
-    return {"success": ok, "method": "webhook re-registration"}
+
+    # Full re-init: reset flags, reload config, re-register
+    bot._initialized = False
+    bot._webhook_url = ""
+    bot._last_error = None
+
+    ok = await bot.init(app_url)
+    return {
+        "success": ok,
+        "initialized": bot._initialized,
+        "webhook_url_registered": bool(bot._webhook_url),
+        "error": bot._last_error,
+    }
 
 
 app.include_router(api_router)

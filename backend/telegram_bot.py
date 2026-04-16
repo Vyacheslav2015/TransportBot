@@ -11,6 +11,7 @@ Lifecycle:
   shutdown()       → delete webhook from Telegram
 """
 import httpx
+import asyncio
 import json
 import os
 import logging
@@ -43,6 +44,8 @@ class TransportMonitorBot:
         }
         self.webhook_secret = ""
         self._initialized = False
+        self._webhook_url = ""  # what we registered with Telegram
+        self._state_lock = asyncio.Lock()  # protects state read-modify-write
 
         # Health telemetry
         self._last_webhook_received: str | None = None
@@ -113,6 +116,7 @@ class TransportMonitorBot:
             logger.warning(f"Failed to load state: {e}")
 
     def save_state(self):
+        """Non-async save for use inside already-locked contexts."""
         try:
             if len(self.state.get('seenMessages', [])) > 1000:
                 self.state['seenMessages'] = self.state['seenMessages'][-1000:]
@@ -146,6 +150,7 @@ class TransportMonitorBot:
                 'drop_pending_updates': False,
                 'secret_token': self.webhook_secret,
             })
+            self._webhook_url = webhook_url
             logger.info(f"Webhook registered: {result}")
             return True
         except Exception as e:
@@ -198,10 +203,11 @@ class TransportMonitorBot:
         return ok
 
     async def shutdown(self):
-        """Clean shutdown: delete webhook."""
-        await self.delete_webhook()
+        """Graceful shutdown. Does NOT delete webhook — keeps Telegram delivering
+        so the pod can be woken up on next message. Use reset_webhook() for
+        explicit admin removal."""
         self._initialized = False
-        logger.info("Bot shutdown complete")
+        logger.info("Bot shutdown (webhook kept registered for pod wake-up)")
 
     # ─── MESSAGE LOGIC ───────────────────────────────────────
 
@@ -240,7 +246,6 @@ class TransportMonitorBot:
                 now = time.time() * 1000
                 elapsed = now - self.state.get('lastForwardTime', 0)
                 if elapsed < self.config.get('rateLimit', 1000):
-                    import asyncio
                     await asyncio.sleep((self.config['rateLimit'] - elapsed) / 1000)
                 await self.telegram_api('sendMessage', {'chat_id': rid, 'text': forward_text, 'disable_web_page_preview': True})
                 self.state['lastForwardTime'] = time.time() * 1000
@@ -354,68 +359,84 @@ class TransportMonitorBot:
     # ─── WEBHOOK HANDLER ─────────────────────────────────────
 
     async def handle_update(self, update: dict):
-        """Process a single update from Telegram webhook. Called by FastAPI route."""
+        """Process a single update from Telegram webhook.
+        Raises on internal failure so the caller can return non-200 to Telegram."""
         now = datetime.now(timezone.utc).isoformat()
         self._last_webhook_received = now
         self._webhook_count += 1
 
         msg = update.get('message') or update.get('channel_post')
         if not msg:
-            return
+            return  # not a message type we handle — 200 OK is correct
         text = msg.get('text') or msg.get('caption') or ''
         if not text:
-            return
+            return  # no text content — 200 OK is correct
 
-        msg_key = f"{msg['chat']['id']}:{msg['message_id']}"
-        if msg_key in self.state.get('seenMessages', []):
-            return
-        self.state.setdefault('seenMessages', []).append(msg_key)
+        async with self._state_lock:
+            msg_key = f"{msg['chat']['id']}:{msg['message_id']}"
+            if msg_key in self.state.get('seenMessages', []):
+                return  # duplicate — 200 OK
+            self.state.setdefault('seenMessages', []).append(msg_key)
 
-        # Track update ID for state
-        uid = update.get('update_id', 0)
-        if uid > self.state.get('lastUpdateId', 0):
-            self.state['lastUpdateId'] = uid
+            uid = update.get('update_id', 0)
+            if uid > self.state.get('lastUpdateId', 0):
+                self.state['lastUpdateId'] = uid
 
-        self._last_update_processed = now
+            self._last_update_processed = now
 
-        # Commands in private chat
-        if msg.get('chat', {}).get('type') == 'private':
-            if await self.handle_command(msg):
+            # Commands in private chat
+            if msg.get('chat', {}).get('type') == 'private':
+                if await self.handle_command(msg):
+                    self.save_state()
+                    return
+
+            # Chat whitelist
+            allowed = self.config.get('allowedChats', [])
+            if allowed and str(msg['chat']['id']) not in allowed:
                 self.save_state()
                 return
 
-        # Chat whitelist
-        allowed = self.config.get('allowedChats', [])
-        if allowed and str(msg['chat']['id']) not in allowed:
-            self.save_state()
-            return
+            # Skip private non-command messages
+            if msg.get('chat', {}).get('type') == 'private':
+                self.save_state()
+                return
 
-        # Skip private non-command messages
-        if msg.get('chat', {}).get('type') == 'private':
-            self.save_state()
-            return
+            self.state['stats']['totalProcessed'] += 1
+            result = self.score_message(text)
 
-        self.state['stats']['totalProcessed'] += 1
-        result = self.score_message(text)
+            if result['blocked']:
+                self.state['stats']['totalBlocked'] += 1
+                if self.config.get('debug'):
+                    logger.info(f"BLOCKED: '{result['matchedNeg']}' in: {text[:80]}")
+                self.save_state()
+                return
 
-        if result['blocked']:
-            self.state['stats']['totalBlocked'] += 1
             if self.config.get('debug'):
-                logger.info(f"BLOCKED: '{result['matchedNeg']}' in: {text[:80]}")
+                logger.info(f"Score: {result['score']}/{self.config.get('threshold', 1)} for: {text[:80]}... [{', '.join(result.get('matched', []))}]")
+
+            if result['score'] < self.config.get('threshold', 1):
+                self.save_state()
+                return
+
+            # forward_message can raise — let it propagate for Telegram retry
+            await self.forward_message(msg, result['score'], None, result.get('matched'))
             self.save_state()
-            return
-
-        if self.config.get('debug'):
-            logger.info(f"Score: {result['score']}/{self.config.get('threshold', 1)} for: {text[:80]}... [{', '.join(result.get('matched', []))}]")
-
-        if result['score'] < self.config.get('threshold', 1):
-            self.save_state()
-            return
-
-        await self.forward_message(msg, result['score'], None, result.get('matched'))
-        self.save_state()
 
     # ─── STATUS ──────────────────────────────────────────────
+
+    async def fetch_telegram_webhook_info(self):
+        """Fetch real webhook state from Telegram. Returns dict or None on error."""
+        try:
+            info = await self.telegram_api('getWebhookInfo')
+            return {
+                "url_set": bool(info.get('url')),
+                "url_matches": info.get('url', '') == self._webhook_url,
+                "pending_update_count": info.get('pending_update_count', 0),
+                "last_error_date": info.get('last_error_date'),
+                "last_error_message": info.get('last_error_message'),
+            }
+        except Exception:
+            return None
 
     def get_status(self):
         uptime = 0
@@ -430,7 +451,8 @@ class TransportMonitorBot:
             "mode": "webhook",
             "uptime": uptime,
             "health": {
-                "webhook_registered": self._initialized,
+                "initialized": self._initialized,
+                "webhook_url_registered": bool(self._webhook_url),
                 "last_webhook_received": self._last_webhook_received,
                 "last_update_processed": self._last_update_processed,
                 "last_error": self._last_error,
