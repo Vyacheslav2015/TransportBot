@@ -235,8 +235,14 @@ function App() {
   };
 
   const isOnline = status?.status === 'running';
-  const subprocess = status?.subprocess;
-  const diagnostics = status?.diagnostics;
+  const health = status?.health;
+
+  function pollAgo() {
+    if (!health?.last_poll_ok) return null;
+    const secs = Math.floor((Date.now() - new Date(health.last_poll_ok).getTime()) / 1000);
+    if (secs < 60) return `${secs}s ago`;
+    return `${Math.floor(secs / 60)}m ago`;
+  }
 
   if (loading) {
     return (
@@ -298,16 +304,14 @@ function App() {
             <StatusBadge online={isOnline} />
             <div className="mt-auto pt-2 flex flex-col gap-1">
               <span className="font-mono text-xs" style={{ color: 'var(--muted-foreground)' }}>
-                Last Update ID: {status?.lastUpdateId || 0}
+                Last poll: {health?.last_poll_ok ? pollAgo() : 'never'}
               </span>
-              {subprocess && !isOnline && (
+              <span className="font-mono text-xs" style={{ color: 'var(--muted-foreground)' }}>
+                Polls: {health?.poll_count || 0} | Restarts: {health?.restart_count || 0}
+              </span>
+              {health?.last_error && (
                 <span className="font-mono text-xs" style={{ color: 'var(--destructive)' }}>
-                  {subprocess.last_error ? subprocess.last_error.substring(0, 80) : `PID: ${subprocess.pid || 'none'}, attempts: ${subprocess.start_attempts || 0}`}
-                </span>
-              )}
-              {diagnostics && !isOnline && (
-                <span className="font-mono text-xs" style={{ color: 'var(--muted-foreground)' }}>
-                  node: {diagnostics.node_binary ? 'OK' : 'MISSING'} | token: {diagnostics.token_in_env ? 'OK' : 'MISSING'}
+                  {health.last_error.substring(0, 80)}
                 </span>
               )}
             </div>

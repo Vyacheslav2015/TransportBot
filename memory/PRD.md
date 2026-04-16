@@ -1,77 +1,52 @@
 # Transport Monitor Bot - PRD
 
-## Original Problem Statement
-Telegram bot for monitoring groups and forwarding messages with keyword filtering. Node.js based, running on Emergent Cloud with Supervisor.
-
 ## Architecture
 - **Bot**: Python asyncio task running INSIDE FastAPI backend (no Node.js subprocess)
 - **Backend**: FastAPI (Python) at `/app/backend/server.py` + `/app/backend/telegram_bot.py`
 - **Frontend**: React dashboard at `/app/frontend/src/App.js`
 - **Storage**: JSON files (config + state), no database needed
 
-## Core Requirements
-1. Long polling Telegram groups 24/7
-2. Keyword-based filtering (44 positive + 8 negative keywords)
-3. Message forwarding to multiple recipients with formatting
-4. Optional LLM analysis via Claude Sonnet 4.5 (Emergent LLM Key)
-5. Telegram commands for management (/status, /threshold, /llm, /debug, /addchat, /rmchat)
-6. Auto-recovery (immortal bot - never crashes permanently)
-7. Web dashboard for monitoring
-8. Rate limiting + deduplication
-9. Health check script
+## What's Been Implemented
+- [x] Full bot logic: long polling, 44 keyword filtering, 8 negative keywords, multi-recipient forwarding
+- [x] Telegram commands: /start, /status, /threshold, /llm, /debug, /addchat, /rmchat
+- [x] Web dashboard (Swiss brutalist design) with live metrics, logs, restart button
+- [x] **Supervised bot lifecycle**: task handle stored, done-callback for crash detection
+- [x] **Safe restart**: mutex lock prevents duplicate polling loops, cancel-then-start
+- [x] **Truthful health model**: task_alive, polling_active, last_poll_ok, last_error, poll_count, restart_count
+- [x] **Removed fake anti-sleep**: Internal self-ping loop removed (cannot prevent container suspension)
+- [x] **Fixed Node.js defects**: Status no longer hardcodes "running", uses lastPollOk timestamp, keep-alive removed
 
-## What's Been Implemented (2026-04-15)
-- [x] Full bot logic with long polling, keyword scoring, negative keyword blocking
-- [x] Multi-recipient forwarding with rate limiting
-- [x] Command handling (/start, /status, /threshold, /llm, /debug, /addchat, /rmchat)
-- [x] Auto-recovery with 10-second retry on any error
-- [x] LLM integration ready (Claude Sonnet 4.5 via Emergent endpoint)
-- [x] JSON config and state persistence
-- [x] Internal HTTP status server (port 8099)
-- [x] FastAPI backend with bot status/config/logs/restart APIs
-- [x] React dashboard (Swiss brutalist design) with live metrics
-- [x] Supervisor configuration with autorestart
-- [x] Health check script
-- [x] All tests passed 100% (backend, frontend, infrastructure)
-- [x] **FIX: Moved bot files from /root/clawd/ to /app/bot/ for deployment**
-- [x] **FIX: Backend auto-starts bot as subprocess when supervisor not available (deployment)**
-- [x] **FIX: Keep-alive ping every 60s from bot + backend to prevent deployed pod from sleeping**
-- [x] **FIX: Tokens moved to env vars (TELEGRAM_BOT_TOKEN, EMERGENT_LLM_KEY) — removed from JSON**
-- [x] **FIX: Removed sudo from supervisorctl, added bot watchdog (auto-restart subprocess)**
-- [x] **FIX: Backend passes all env vars to bot subprocess on start**
-- [x] **Deployment agent: PASS - no blockers found**
+## Root Cause Analysis (2026-04-16)
+1. Bot task was fire-and-forget (`asyncio.create_task` with no handle) — silent death undetected
+2. `self.running` flag was never cleared when task crashed — status lied "running"
+3. No heartbeat timestamp — couldn't distinguish active polling from dead process
+4. Restart created duplicate polling loops (race with 30s long-poll timeout)
+5. Internal self-ping cannot prevent container suspension (same process sleeps together)
 
-## User Personas
-- **Bot Owner**: Manages bot via Telegram commands and web dashboard
-- **Recipients**: Receive forwarded transport-related messages
+## Platform Limitation
+Emergent native deployment may suspend pods during inactivity. Code alone cannot prevent this.
+**Recommended solutions** (external to code):
+- External uptime monitor (e.g. UptimeRobot) pinging the deployed URL
+- Telegram Webhook mode (incoming webhooks wake the pod)
+- Always-on hosting tier or dedicated worker process
 
-## Configuration
-- Bot Token: Set in /root/clawd/transport-bot-config.json
-- LLM Key: sk-emergent-15213DaCe768a5629E
-- Recipients: 901271393, 5765433747
-- Threshold: 1 (configurable 1-10)
-- LLM: OFF by default
+## Files Changed (2026-04-16)
+- `backend/telegram_bot.py` — Complete lifecycle rewrite (start/stop/restart with lock, health telemetry, done-callback)
+- `backend/server.py` — Proper startup/shutdown, removed internal keep-alive
+- `bot/transport-monitor-bot.js` — Fixed status lies, removed keep-alive, added lastPollOk
+- `frontend/src/App.js` — Dashboard shows real health data
 
 ## Backlog
-### P0 (Critical) - Done
-- [x] Bot polling and message processing
-- [x] Keyword filtering
-- [x] Message forwarding
-- [x] Auto-recovery
+### P0 - Done
+- [x] Supervised bot lifecycle
+- [x] Truthful health reporting
+- [x] Safe restart without duplicate loops
 
-### P1 (Important) - Done
-- [x] Web dashboard
-- [x] Command handling
-- [x] Health check
+### P1 - Recommended
+- [ ] Webhook mode for Telegram (eliminates long-polling, works with pod suspension)
+- [ ] External uptime monitor integration
 
-### P2 (Nice to Have)
-- [ ] Webhook support (alternative to polling)
-- [ ] Statistics history/charts on dashboard
-- [ ] Web UI for editing keywords/config
-- [ ] Multiple language support
-- [ ] Message history storage in MongoDB
-
-## Next Tasks
-- Test bot in real Telegram groups
-- Add keyword management via web dashboard
-- Add message history/statistics charts
+### P2 - Nice to Have
+- [ ] Web UI keyword editor
+- [ ] Statistics history charts
+- [ ] Message history in MongoDB

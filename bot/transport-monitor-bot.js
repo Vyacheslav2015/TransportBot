@@ -480,6 +480,9 @@ async function poll() {
     allowed_updates: ['message', 'channel_post']
   });
 
+  lastPollOk = new Date().toISOString();
+  pollCount++;
+
   if (updates && updates.length > 0) {
     log(`Received ${updates.length} update(s)`);
 
@@ -497,6 +500,12 @@ async function poll() {
 }
 
 // ─── HTTP STATUS SERVER ─────────────────────────────────────
+// NOTE: This Node.js bot is NOT the active implementation.
+// The Python bot (backend/telegram_bot.py) is active.
+// Keeping this code correct so it doesn't lie if ever reactivated.
+
+let lastPollOk = null; // ISO timestamp of last successful poll
+let pollCount = 0;
 
 function startStatusServer() {
   const port = 8099;
@@ -506,9 +515,19 @@ function startStatusServer() {
     res.setHeader('Access-Control-Allow-Methods', 'GET');
 
     if (req.url === '/health' || req.url === '/bot-status') {
+      // Determine real status: if no poll in 120s, we are degraded
+      let status = 'stopped';
+      if (lastPollOk) {
+        const secsSincePoll = Math.floor((Date.now() - new Date(lastPollOk).getTime()) / 1000);
+        status = secsSincePoll < 120 ? 'running' : 'degraded';
+      }
       const statusData = {
-        status: 'running',
+        status,
         uptime: state.stats.startedAt ? Math.floor((Date.now() - new Date(state.stats.startedAt).getTime()) / 1000) : 0,
+        health: {
+          lastPollOk,
+          pollCount,
+        },
         config: {
           useLLM: config.useLLM,
           debug: config.debug,
@@ -539,45 +558,12 @@ function startStatusServer() {
 }
 
 // ─── KEEP-ALIVE PING ────────────────────────────────────────
-
-function startKeepAlive() {
-  // Get the app URL from env (set by Emergent on deploy)
-  const appUrl = process.env.APP_URL || process.env.REACT_APP_BACKEND_URL || '';
-  if (!appUrl) {
-    logAlways('No APP_URL set, keep-alive disabled');
-    return;
-  }
-
-  const statusUrl = appUrl.replace(/\/$/, '') + '/api/bot/status';
-  logAlways(`Keep-alive ping target: ${statusUrl} (every 60s)`);
-
-  // Aggressive keep-alive: every 60 seconds with real API call
-  setInterval(() => {
-    const url = new URL(statusUrl);
-    const options = {
-      hostname: url.hostname,
-      port: url.port || 443,
-      path: url.pathname,
-      method: 'GET',
-      headers: { 'User-Agent': 'TransportBot-KeepAlive/2.0', 'Accept': 'application/json' },
-      timeout: 10000
-    };
-
-    const transport = url.protocol === 'https:' ? https : http;
-    const req = transport.request(options, (res) => {
-      let body = '';
-      res.on('data', chunk => body += chunk);
-      res.on('end', () => {
-        log(`Keep-alive OK (${res.statusCode})`);
-      });
-    });
-    req.on('error', (err) => {
-      log(`Keep-alive failed: ${err.message}`);
-    });
-    req.on('timeout', () => { req.destroy(); });
-    req.end();
-  }, 60 * 1000); // every 60 seconds
-}
+// DISABLED: Internal self-ping from the same process cannot prevent
+// container suspension. If this process sleeps, the ping sleeps too.
+// For anti-sleep, use an EXTERNAL monitor (e.g. UptimeRobot) or webhook mode.
+//
+// function startKeepAlive() { ... }
+// Keeping code commented out for reference. Do not re-enable.
 
 // ─── UTILITIES ──────────────────────────────────────────────
 
@@ -591,7 +577,7 @@ async function startWithRecovery() {
   loadConfig();
   loadState();
   startStatusServer();
-  startKeepAlive();
+  // startKeepAlive() removed — internal self-ping is ineffective
 
   logAlways('Transport Monitor Bot starting...');
   logAlways(`Bot token: ${config.botToken ? config.botToken.substring(0, 10) + '...' : 'MISSING'}`);

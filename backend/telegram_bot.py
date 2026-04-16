@@ -1,3 +1,10 @@
+"""
+Telegram Transport Monitor Bot — Python asyncio implementation.
+Runs as a supervised background task inside the FastAPI process.
+
+Lifecycle: start() → creates asyncio task → poll loop → stop() cancels it.
+Health: tracks last_poll_ok, last_error, task alive/dead via get_status().
+"""
 import httpx
 import asyncio
 import json
@@ -12,7 +19,6 @@ logger = logging.getLogger(__name__)
 BOT_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'bot')
 CONFIG_PATH = os.path.join(BOT_DIR, 'transport-bot-config.json')
 STATE_PATH = os.path.join(BOT_DIR, 'transport-bot-state.json')
-
 TELEGRAM_API = "https://api.telegram.org"
 
 
@@ -25,8 +31,20 @@ class TransportMonitorBot:
             "lastForwardTime": 0,
             "stats": {"totalProcessed": 0, "totalForwarded": 0, "totalBlocked": 0, "startedAt": None}
         }
-        self.running = False
-        self._task = None
+        # Lifecycle
+        self._task: asyncio.Task | None = None
+        self._lock = asyncio.Lock()  # prevents concurrent start/stop
+        self._polling = False  # True only while poll loop is actively running
+
+        # Health telemetry
+        self._last_poll_ok: str | None = None  # ISO timestamp of last successful poll cycle
+        self._last_update_received: str | None = None  # ISO timestamp of last Telegram update
+        self._last_error: str | None = None
+        self._restart_count = 0
+        self._poll_count = 0
+        self._started_at: str | None = None
+
+    # ─── CONFIG & STATE ──────────────────────────────────────
 
     def load_config(self):
         try:
@@ -36,13 +54,11 @@ class TransportMonitorBot:
             logger.warning(f"Config JSON load failed: {e}, using defaults")
             self.config = {}
 
-        # Env overrides ALWAYS take priority
         if os.environ.get('TELEGRAM_BOT_TOKEN'):
             self.config['botToken'] = os.environ['TELEGRAM_BOT_TOKEN']
         if os.environ.get('EMERGENT_LLM_KEY'):
             self.config['llmApiKey'] = os.environ['EMERGENT_LLM_KEY']
 
-        # Defaults
         self.config.setdefault('keywords', [
             "такси", "трансфер", "водитель", "машин", "поездк",
             "довезти", "подвезти", "подвезу", "везу",
@@ -66,8 +82,7 @@ class TransportMonitorBot:
         self.config.setdefault('llmModel', 'claude-sonnet-4-5-20250929')
         self.config.setdefault('debug', True)
         self.config.setdefault('allowedChats', [])
-
-        logger.info(f"Bot config loaded: token={'SET' if self.config.get('botToken') else 'MISSING'}, keywords={len(self.config['keywords'])}")
+        logger.info(f"Config loaded: token={'SET' if self.config.get('botToken') else 'MISSING'}, kw={len(self.config['keywords'])}")
 
     def save_config(self):
         try:
@@ -86,7 +101,6 @@ class TransportMonitorBot:
                     self.state = json.load(f)
             if 'stats' not in self.state:
                 self.state['stats'] = {"totalProcessed": 0, "totalForwarded": 0, "totalBlocked": 0, "startedAt": None}
-            self.state['stats']['startedAt'] = datetime.now(timezone.utc).isoformat()
             logger.info(f"State loaded: lastUpdateId={self.state['lastUpdateId']}, seen={len(self.state.get('seenMessages', []))}")
         except Exception as e:
             logger.warning(f"Failed to load state: {e}")
@@ -97,8 +111,10 @@ class TransportMonitorBot:
                 self.state['seenMessages'] = self.state['seenMessages'][-1000:]
             with open(STATE_PATH, 'w') as f:
                 json.dump(self.state, f, indent=2)
-        except Exception as e:
-            logger.warning(f"Failed to save state: {e}")
+        except Exception:
+            pass
+
+    # ─── TELEGRAM API ────────────────────────────────────────
 
     async def telegram_api(self, method, params=None):
         token = self.config.get('botToken', '')
@@ -110,6 +126,8 @@ class TransportMonitorBot:
             if data.get('ok'):
                 return data.get('result')
             raise Exception(f"Telegram API: {data.get('description', 'Unknown error')}")
+
+    # ─── MESSAGE LOGIC (unchanged business logic) ────────────
 
     def score_message(self, text):
         lower = text.lower()
@@ -129,11 +147,9 @@ class TransportMonitorBot:
         from_user = msg.get('from', {})
         user_name = f"@{from_user['username']}" if from_user.get('username') else f"{from_user.get('first_name', '')} {from_user.get('last_name', '')}".strip() or 'Unknown'
         text = msg.get('text') or msg.get('caption') or ''
-
         llm_status = 'OFF'
         if self.config.get('useLLM'):
             llm_status = 'YES' if llm_result else 'NO'
-
         forward_text = (
             f"\U0001F697 Новый запрос\n\n"
             f"\U0001F4CD Группа: {chat_title}\n"
@@ -143,22 +159,18 @@ class TransportMonitorBot:
         if matched:
             forward_text += f"\U0001F50D Слова: {', '.join(matched)}\n"
         forward_text += f"\n{text[:3000]}"
-
         for rid in self.config.get('destUserIds', []):
             try:
                 now = time.time() * 1000
                 elapsed = now - self.state.get('lastForwardTime', 0)
                 if elapsed < self.config.get('rateLimit', 1000):
                     await asyncio.sleep((self.config['rateLimit'] - elapsed) / 1000)
-                await self.telegram_api('sendMessage', {
-                    'chat_id': rid, 'text': forward_text, 'disable_web_page_preview': True
-                })
+                await self.telegram_api('sendMessage', {'chat_id': rid, 'text': forward_text, 'disable_web_page_preview': True})
                 self.state['lastForwardTime'] = time.time() * 1000
                 if self.config.get('debug'):
                     logger.info(f"Forwarded to {rid}")
             except Exception as e:
                 logger.warning(f"Forward to {rid} failed: {e}")
-
         self.state['stats']['totalForwarded'] += 1
 
     def is_owner(self, user_id):
@@ -175,11 +187,14 @@ class TransportMonitorBot:
         cmd = parts[0].lower().split('@')[0]
         arg = parts[1] if len(parts) > 1 else ''
         reply = ''
-
         if cmd == '/start':
             reply = "\U0001F697 Transport Monitor Bot\n\nКоманды:\n/status - Текущая конфигурация\n/threshold <n> - Порог (1-10)\n/llm on|off - LLM анализ\n/debug on|off - Debug логи\n/addchat <id> - Добавить группу\n/rmchat <id> - Удалить группу"
         elif cmd == '/status':
             s = self.state.get('stats', {})
+            poll_ago = ''
+            if self._last_poll_ok:
+                secs = int((datetime.now(timezone.utc) - datetime.fromisoformat(self._last_poll_ok)).total_seconds())
+                poll_ago = f" ({secs}s ago)"
             reply = (
                 f"\U0001F4CA Status:\n\n"
                 f"\U0001F527 Mode: {'Keywords + LLM' if self.config.get('useLLM') else 'Keywords only'}\n"
@@ -190,7 +205,9 @@ class TransportMonitorBot:
                 f"\U0001F465 Recipients: {len(self.config.get('destUserIds', []))}\n"
                 f"\U0001F4BE Seen: {len(self.state.get('seenMessages', []))}\n"
                 f"\U0001F50D Debug: {'ON' if self.config.get('debug') else 'OFF'}\n"
-                f"\U0001F9E0 LLM: {'ON' if self.config.get('useLLM') else 'OFF'}\n\n"
+                f"\U0001F9E0 LLM: {'ON' if self.config.get('useLLM') else 'OFF'}\n"
+                f"\U0001F4E1 Polling: {'active' if self._polling else 'DEAD'}{poll_ago}\n"
+                f"\U0001F504 Polls: {self._poll_count}\n\n"
                 f"\U0001F4C8 Stats:\n  Processed: {s.get('totalProcessed', 0)}\n  Forwarded: {s.get('totalForwarded', 0)}\n  Blocked: {s.get('totalBlocked', 0)}"
             )
         elif cmd == '/threshold':
@@ -229,14 +246,13 @@ class TransportMonitorBot:
         elif cmd == '/addchat':
             if arg:
                 cid = arg if arg.startswith('-') else f"-{arg}"
-                if 'allowedChats' not in self.config:
-                    self.config['allowedChats'] = []
+                self.config.setdefault('allowedChats', [])
                 if cid not in self.config['allowedChats']:
                     self.config['allowedChats'].append(cid)
                     self.save_config()
                     reply = f"\u2705 Chat {cid} added"
                 else:
-                    reply = f"\u2139\ufe0f Already in whitelist"
+                    reply = "\u2139\ufe0f Already in whitelist"
             else:
                 reply = "\u274C Usage: /addchat <chat_id>"
         elif cmd == '/rmchat':
@@ -250,7 +266,6 @@ class TransportMonitorBot:
                 reply = "\u274C Usage: /rmchat <chat_id>"
         else:
             return False
-
         if reply:
             try:
                 await self.telegram_api('sendMessage', {'chat_id': msg['chat']['id'], 'text': reply})
@@ -265,51 +280,43 @@ class TransportMonitorBot:
         text = msg.get('text') or msg.get('caption') or ''
         if not text:
             return
-
         msg_key = f"{msg['chat']['id']}:{msg['message_id']}"
         if msg_key in self.state.get('seenMessages', []):
             return
         self.state.setdefault('seenMessages', []).append(msg_key)
-
         if msg.get('chat', {}).get('type') == 'private':
-            handled = await self.handle_command(msg)
-            if handled:
+            if await self.handle_command(msg):
                 return
-
         allowed = self.config.get('allowedChats', [])
-        if allowed:
-            if str(msg['chat']['id']) not in allowed:
-                return
-
+        if allowed and str(msg['chat']['id']) not in allowed:
+            return
         if msg.get('chat', {}).get('type') == 'private':
             return
-
         self.state['stats']['totalProcessed'] += 1
         result = self.score_message(text)
-
         if result['blocked']:
             self.state['stats']['totalBlocked'] += 1
             if self.config.get('debug'):
                 logger.info(f"BLOCKED: '{result['matchedNeg']}' in: {text[:80]}")
             return
-
         if self.config.get('debug'):
             logger.info(f"Score: {result['score']}/{self.config.get('threshold', 1)} for: {text[:80]}... [{', '.join(result.get('matched', []))}]")
-
         if result['score'] < self.config.get('threshold', 1):
             return
-
         await self.forward_message(msg, result['score'], None, result.get('matched'))
 
+    # ─── POLLING ─────────────────────────────────────────────
+
     async def poll(self):
-        if self.config.get('debug'):
-            logger.debug("Polling...")
         updates = await self.telegram_api('getUpdates', {
             'offset': self.state.get('lastUpdateId', 0) + 1,
             'timeout': 30,
             'allowed_updates': ['message', 'channel_post']
         })
+        self._last_poll_ok = datetime.now(timezone.utc).isoformat()
+        self._poll_count += 1
         if updates:
+            self._last_update_received = datetime.now(timezone.utc).isoformat()
             if self.config.get('debug'):
                 logger.info(f"Received {len(updates)} update(s)")
             for u in updates:
@@ -320,41 +327,123 @@ class TransportMonitorBot:
                     logger.warning(f"Error processing update: {e}")
             self.save_state()
 
-    async def run(self):
+    async def _poll_loop(self):
+        """The inner polling loop. Runs until cancelled or self._polling is cleared."""
         self.load_config()
         self.load_state()
 
         if not self.config.get('botToken'):
-            logger.error("NO BOT TOKEN - cannot start bot")
+            logger.error("NO BOT TOKEN — cannot start bot")
             return
 
-        self.running = True
+        self._polling = True
+        self._started_at = datetime.now(timezone.utc).isoformat()
+        self.state['stats']['startedAt'] = self._started_at
+
         logger.info("=== Transport Monitor Bot starting (Python) ===")
         logger.info(f"Token: {self.config['botToken'][:10]}...")
         logger.info(f"Recipients: {', '.join(self.config.get('destUserIds', []))}")
         logger.info(f"Keywords: {len(self.config.get('keywords', []))} pos, {len(self.config.get('negKeywords', []))} neg")
 
-        # Startup notification
         try:
             for uid in self.config.get('destUserIds', []):
                 await self.telegram_api('sendMessage', {
                     'chat_id': uid,
-                    'text': '\u2705 Transport Monitor Bot started! (Python)\n\n/status - check config\n/start - all commands'
+                    'text': '\u2705 Transport Monitor Bot started!\n\n/status - check config\n/start - all commands'
                 })
         except Exception as e:
             logger.warning(f"Startup notification failed: {e}")
 
-        while self.running:
-            try:
-                await self.poll()
-            except Exception as e:
-                logger.error(f"Poll error, retry in 10s: {e}")
-                await asyncio.sleep(10)
+        try:
+            while self._polling:
+                try:
+                    await self.poll()
+                except asyncio.CancelledError:
+                    raise  # let cancellation propagate
+                except Exception as e:
+                    self._last_error = f"{datetime.now(timezone.utc).isoformat()} {e}"
+                    logger.error(f"Poll error, retry in 10s: {e}")
+                    await asyncio.sleep(10)
+        finally:
+            self._polling = False
+            logger.info("Bot polling loop stopped")
+
+    # ─── PUBLIC LIFECYCLE API ────────────────────────────────
+
+    async def start(self):
+        """Start the bot polling task. Safe to call multiple times."""
+        async with self._lock:
+            if self._task and not self._task.done():
+                logger.info("Bot already running, ignoring duplicate start")
+                return
+            logger.info("Starting bot task...")
+            self._task = asyncio.create_task(self._poll_loop(), name="telegram-bot")
+            self._task.add_done_callback(self._on_task_done)
+
+    def _on_task_done(self, task: asyncio.Task):
+        """Callback when the bot task finishes (crash or clean stop)."""
+        try:
+            exc = task.exception()
+        except asyncio.CancelledError:
+            logger.info("Bot task was cancelled (clean shutdown)")
+            return
+        if exc:
+            self._last_error = f"{datetime.now(timezone.utc).isoformat()} TASK CRASHED: {exc}"
+            logger.error(f"Bot task CRASHED: {exc}")
+        else:
+            logger.info("Bot task exited normally")
+
+    async def stop(self):
+        """Stop the bot polling task. Waits for clean exit."""
+        async with self._lock:
+            self._polling = False
+            if self._task and not self._task.done():
+                self._task.cancel()
+                try:
+                    await asyncio.wait_for(self._task, timeout=5)
+                except (asyncio.CancelledError, asyncio.TimeoutError):
+                    pass
+            self._task = None
+            logger.info("Bot stopped")
+
+    async def restart(self):
+        """Safe restart: fully stop, then start. No duplicate loops."""
+        self._restart_count += 1
+        logger.info(f"Bot restart #{self._restart_count}")
+        await self.stop()
+        await self.start()
+
+    # ─── STATUS ──────────────────────────────────────────────
 
     def get_status(self):
+        task_alive = self._task is not None and not self._task.done()
+        # Determine real status
+        if task_alive and self._polling:
+            status = "running"
+        elif task_alive and not self._polling:
+            status = "starting"
+        else:
+            status = "stopped"
+
+        uptime = 0
+        if self._started_at:
+            try:
+                uptime = int((datetime.now(timezone.utc) - datetime.fromisoformat(self._started_at)).total_seconds())
+            except Exception:
+                pass
+
         return {
-            "status": "running" if self.running else "stopped",
-            "uptime": int((datetime.now(timezone.utc) - datetime.fromisoformat(self.state['stats']['startedAt'])).total_seconds()) if self.state.get('stats', {}).get('startedAt') else 0,
+            "status": status,
+            "uptime": uptime,
+            "health": {
+                "task_alive": task_alive,
+                "polling_active": self._polling,
+                "last_poll_ok": self._last_poll_ok,
+                "last_update_received": self._last_update_received,
+                "last_error": self._last_error,
+                "poll_count": self._poll_count,
+                "restart_count": self._restart_count,
+            },
             "config": {
                 "useLLM": self.config.get('useLLM', False),
                 "debug": self.config.get('debug', True),
@@ -372,8 +461,6 @@ class TransportMonitorBot:
             "timestamp": datetime.now(timezone.utc).isoformat()
         }
 
-    def stop(self):
-        self.running = False
 
-# Global bot instance
+# Global singleton
 bot = TransportMonitorBot()
