@@ -6,6 +6,7 @@ import logging
 import json
 import subprocess
 import signal
+import asyncio
 from pathlib import Path
 from datetime import datetime, timezone
 import httpx
@@ -46,7 +47,7 @@ def start_bot_process():
             cwd=BOT_DIR,
             stdout=stdout_f,
             stderr=stderr_f,
-            env={**os.environ, 'NODE_ENV': 'production'}
+            env={**os.environ, 'NODE_ENV': 'production', 'APP_URL': os.environ.get('APP_URL', '')}
         )
         logger.info("Bot started (PID: %s)", bot_process.pid)
     except Exception as e:
@@ -84,6 +85,25 @@ def ensure_bot_running():
 async def startup_event():
     logger.info("Backend starting, ensuring bot is running...")
     ensure_bot_running()
+    # Start keep-alive background task
+    asyncio.create_task(keep_alive_loop())
+
+async def keep_alive_loop():
+    """Ping self every 4 minutes to prevent pod from sleeping"""
+    app_url = os.environ.get('APP_URL', '')
+    if not app_url:
+        logger.info("No APP_URL, keep-alive from backend disabled")
+        return
+    ping_url = app_url.rstrip('/') + '/api/'
+    logger.info(f"Backend keep-alive target: {ping_url}")
+    while True:
+        await asyncio.sleep(240)  # 4 minutes
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get(ping_url)
+                logger.info(f"Keep-alive ping: {resp.status_code}")
+        except Exception as e:
+            logger.warning(f"Keep-alive ping failed: {e}")
 
 @app.on_event("shutdown")
 async def shutdown_event():

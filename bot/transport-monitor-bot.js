@@ -528,6 +528,46 @@ function startStatusServer() {
   });
 }
 
+// ─── KEEP-ALIVE PING ────────────────────────────────────────
+
+function startKeepAlive() {
+  // Get the app URL from env (set by Emergent on deploy)
+  const appUrl = process.env.APP_URL || process.env.REACT_APP_BACKEND_URL || '';
+  if (!appUrl) {
+    logAlways('No APP_URL set, keep-alive disabled');
+    return;
+  }
+
+  const pingUrl = appUrl.replace(/\/$/, '') + '/api/';
+  logAlways(`Keep-alive ping target: ${pingUrl}`);
+
+  // Ping every 4 minutes to prevent pod from sleeping
+  setInterval(() => {
+    const url = new URL(pingUrl);
+    const options = {
+      hostname: url.hostname,
+      port: url.port || 443,
+      path: url.pathname,
+      method: 'GET',
+      timeout: 10000
+    };
+
+    const transport = url.protocol === 'https:' ? https : http;
+    const req = transport.request(options, (res) => {
+      let body = '';
+      res.on('data', chunk => body += chunk);
+      res.on('end', () => {
+        log(`Keep-alive ping OK (${res.statusCode})`);
+      });
+    });
+    req.on('error', (err) => {
+      log(`Keep-alive ping failed: ${err.message}`);
+    });
+    req.on('timeout', () => { req.destroy(); });
+    req.end();
+  }, 4 * 60 * 1000); // every 4 minutes
+}
+
 // ─── UTILITIES ──────────────────────────────────────────────
 
 function sleep(ms) {
@@ -540,6 +580,7 @@ async function startWithRecovery() {
   loadConfig();
   loadState();
   startStatusServer();
+  startKeepAlive();
 
   logAlways('Transport Monitor Bot starting...');
   logAlways(`Bot token: ${config.botToken ? config.botToken.substring(0, 10) + '...' : 'MISSING'}`);
